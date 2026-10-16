@@ -254,6 +254,11 @@ kk_get_device_features(
       .shaderInt16 = true,
       .shaderInt64 = true,
       .shaderResourceMinLod = true,
+      .sparseBinding = KK_EXPERIMENTAL(SPARSE),
+      .sparseResidencyBuffer = KK_EXPERIMENTAL(SPARSE),
+      .sparseResidencyImage2D = KK_EXPERIMENTAL(SPARSE),
+      .shaderResourceResidency = KK_EXPERIMENTAL(SPARSE),
+      .sparseResidencyAliased = KK_EXPERIMENTAL(SPARSE),
       .shaderSampledImageArrayDynamicIndexing = true,
       .shaderStorageBufferArrayDynamicIndexing = true,
       .shaderStorageImageArrayDynamicIndexing = true,
@@ -677,9 +682,9 @@ kk_get_device_properties(
       .nonCoherentAtomSize = 64,
 
       /* Vulkan 1.0 sparse properties */
-      .sparseResidencyNonResidentStrict = false,
+      .sparseResidencyNonResidentStrict = KK_EXPERIMENTAL(SPARSE),
       .sparseResidencyAlignedMipSize = false,
-      .sparseResidencyStandard2DBlockShape = false,
+      .sparseResidencyStandard2DBlockShape = KK_EXPERIMENTAL(SPARSE),
       .sparseResidencyStandard2DMultisampleBlockShape = false,
       .sparseResidencyStandard3DBlockShape = false,
 
@@ -1232,7 +1237,8 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
 
    pdev->queue_families[pdev->queue_family_count++] = (struct kk_queue_family){
       .queue_flags =
-         VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
+         VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT |
+         (KK_EXPERIMENTAL(SPARSE) ? VK_QUEUE_SPARSE_BINDING_BIT : 0),
       .queue_count = 1,
    };
    assert(pdev->queue_family_count <= ARRAY_SIZE(pdev->queue_families));

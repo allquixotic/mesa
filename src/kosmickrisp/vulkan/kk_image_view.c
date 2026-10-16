@@ -227,7 +227,8 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
          bool requires_type_change =
             view_layout.view_type != VK_IMAGE_VIEW_TYPE_3D &&
             view_layout.view_type != VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-         bool requires_format_change = view->vk.format != image->vk.format;
+         bool requires_format_change =
+            view_layout.format.mtl != plane->layout.format.mtl;
          VkImageViewType original_type = view_layout.view_type;
 
          /* Required so sampling from input attachments actually return (d, 0,

@@ -176,8 +176,13 @@ kk_image_layout_init(const struct kk_device *dev, const struct vk_image *image,
    layout->linear = image->tiling != VK_IMAGE_TILING_OPTIMAL;
    layout->optimized_layout = kk_image_layout_can_optimize(
       pdev, image->usage, image->tiling, image->create_flags, format);
+   const bool int64_views =
+      supported_format->mtl_pixel_format == MTL_PIXEL_FORMAT_R32G32_UINT &&
+      (image->usage & VK_IMAGE_USAGE_STORAGE_BIT) && image->samples == 1u &&
+      (image->create_flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT);
    layout->usage = vk_image_usage_flags_to_mtl_texture_usage(
-      image->usage, image->create_flags, supported_format->atomic);
+      image->usage, image->create_flags,
+      supported_format->atomic || int64_views);
    layout->create_flags = image->create_flags;
    layout->format.pipe = format;
    layout->format.mtl = supported_format->mtl_pixel_format;

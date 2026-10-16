@@ -491,7 +491,7 @@ dri2_pbuffer_visual_index(enum pipe_format format)
 }
 
 void
-dri2_add_pbuffer_configs_for_visuals(_EGLDisplay *disp)
+dri2_add_configs_for_visuals(_EGLDisplay *disp, EGLint surface_type)
 {
    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
    unsigned int format_count[ARRAY_SIZE(dri2_pbuffer_visuals)] = {0};
@@ -519,7 +519,7 @@ dri2_add_pbuffer_configs_for_visuals(_EGLDisplay *disp)
       };
 
       dri2_conf = dri2_add_config(disp, dri2_dpy->driver_configs[i],
-                                  EGL_PBUFFER_BIT, attr_list);
+                                  surface_type, attr_list);
       if (dri2_conf)
          format_count[idx]++;
    }
@@ -530,6 +530,12 @@ dri2_add_pbuffer_configs_for_visuals(_EGLDisplay *disp)
                  util_format_name(dri2_pbuffer_visuals[i]));
       }
    }
+}
+
+void
+dri2_add_pbuffer_configs_for_visuals(_EGLDisplay *disp)
+{
+   dri2_add_configs_for_visuals(disp, EGL_PBUFFER_BIT);
 }
 
 GLboolean

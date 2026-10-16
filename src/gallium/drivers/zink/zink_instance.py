@@ -54,6 +54,7 @@ EXTENSIONS = [
 if platform.system() == "Darwin":
     EXTENSIONS += [
         Extension("VK_KHR_portability_enumeration"),
+        Extension("VK_EXT_metal_surface"),
     ]
 
 # constructor: Layer(name, conditions=[])

@@ -69,6 +69,7 @@ struct kk_shader_info {
          uint32_t attribs_read;
          uint32_t sample_count;
          uint64_t outputs_written;
+         bool provoking_ids;
 
          /* Data needed for serialization. */
          enum mtl_primitive_topology_class topology;

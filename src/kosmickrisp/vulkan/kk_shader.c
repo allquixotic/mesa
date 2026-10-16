@@ -315,10 +315,22 @@ kk_nir_swizzle_fragment_output(nir_builder *b, nir_intrinsic_instr *intrin,
             channel_swizzle[channel_unswizzle[i]] = i;
 
          b->cursor = nir_before_instr(&intrin->instr);
-         nir_def *to_replace = intrin->src[0].ssa;
-         nir_def *swizzled = nir_swizzle(b, to_replace, channel_swizzle,
-                                         to_replace->num_components);
+         nir_def *value = intrin->src[0].ssa;
+         unsigned first = nir_intrinsic_component(intrin);
+         unsigned mask = nir_intrinsic_write_mask(intrin);
+         nir_def *undef = nir_undef(b, 1, value->bit_size);
+         nir_def *channels[4] = {undef, undef, undef, undef};
+         for (unsigned i = 0; i < value->num_components; i++) {
+            if ((mask & BITFIELD_BIT(i)) && first + i < 4)
+               channels[first + i] = nir_channel(b, value, i);
+         }
+
+         nir_def *swizzled = nir_swizzle(b, nir_vec(b, channels, 4),
+                                         channel_swizzle, 4);
          nir_src_rewrite(&intrin->src[0], swizzled);
+         intrin->num_components = 4;
+         nir_intrinsic_set_component(intrin, 0);
+         nir_intrinsic_set_write_mask(intrin, 0xf);
       } else {
          b->cursor = nir_after_instr(&intrin->instr);
          nir_def *to_replace = &intrin->def;
@@ -428,6 +440,129 @@ kk_get_logical_color_att_index(const struct vk_graphics_pipeline_state *state,
    return (state->cal) ? state->cal->color_map[i] : i;
 }
 
+struct kk_split_color {
+   nir_variable *var[FRAG_RESULT_MAX][2];
+   nir_intrinsic_instr *store[FRAG_RESULT_MAX][2];
+   uint8_t mask[FRAG_RESULT_MAX][2];
+   bool split[FRAG_RESULT_MAX][2];
+};
+
+static bool
+kk_is_split_color_store(nir_intrinsic_instr *intr)
+{
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   return sem.location >= FRAG_RESULT_DATA0 &&
+          (nir_intrinsic_component(intr) != 0 ||
+           intr->src[0].ssa->num_components < 4);
+}
+
+static bool
+kk_gather_split_color(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct kk_split_color *split = data;
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+
+   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   if (sem.location < FRAG_RESULT_DATA0)
+      return false;
+   if (kk_is_split_color_store(intr))
+      split->split[sem.location][sem.dual_source_blend_index] = true;
+
+   unsigned index = sem.dual_source_blend_index;
+   unsigned mask = nir_intrinsic_write_mask(intr)
+                   << nir_intrinsic_component(intr);
+   split->mask[sem.location][index] |= mask;
+   if (!split->store[sem.location][index])
+      split->store[sem.location][index] = intr;
+   return false;
+}
+
+static bool
+kk_merge_split_color(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct kk_split_color *split = data;
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+
+   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   if (sem.location < FRAG_RESULT_DATA0)
+      return false;
+   nir_variable *var = split->var[sem.location][sem.dual_source_blend_index];
+   if (!var)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   unsigned first = nir_intrinsic_component(intr);
+   nir_def *value = intr->src[0].ssa;
+   nir_def *channels[4];
+   for (unsigned c = 0; c < 4; c++) {
+      channels[c] = c >= first && c - first < value->num_components
+                       ? nir_channel(b, value, c - first)
+                       : nir_undef(b, 1, value->bit_size);
+   }
+   nir_store_var(b, var, nir_vec(b, channels, 4),
+                 nir_intrinsic_write_mask(intr) << first);
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+static bool
+kk_nir_merge_split_color_outputs(nir_shader *nir)
+{
+   struct kk_split_color split = {0};
+   nir_shader_intrinsics_pass(nir, kk_gather_split_color, nir_metadata_all,
+                              &split);
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   bool any = false;
+   for (unsigned loc = FRAG_RESULT_DATA0; loc < FRAG_RESULT_MAX; loc++) {
+      for (unsigned i = 0; i < 2; i++) {
+         nir_intrinsic_instr *store = split.store[loc][i];
+         if (!store || !split.split[loc][i])
+            continue;
+         unsigned bit_size = store->src[0].ssa->bit_size;
+         split.var[loc][i] = nir_local_variable_create(
+            impl, glsl_vector_type(bit_size == 16 ? GLSL_TYPE_UINT16
+                                                  : GLSL_TYPE_UINT, 4),
+            "split_color");
+         nir_store_var(&b, split.var[loc][i], nir_undef(&b, 4, bit_size), 0xf);
+         any = true;
+      }
+   }
+   if (!any)
+      return false;
+
+   nir_shader_intrinsics_pass(nir, kk_merge_split_color, nir_metadata_none,
+                              &split);
+
+   b.cursor = nir_after_impl(impl);
+   for (unsigned loc = FRAG_RESULT_DATA0; loc < FRAG_RESULT_MAX; loc++) {
+      for (unsigned i = 0; i < 2; i++) {
+         nir_intrinsic_instr *store = split.store[loc][i];
+         if (!store || !split.split[loc][i])
+            continue;
+         unsigned count = util_last_bit(split.mask[loc][i]);
+         nir_io_semantics sem = nir_intrinsic_io_semantics(store);
+         nir_store_output(&b,
+                          nir_trim_vector(&b, nir_load_var(&b, split.var[loc][i]),
+                                          count),
+                          nir_imm_int(&b, 0), .base = nir_intrinsic_base(store),
+                          .range = 1, .write_mask = split.mask[loc][i],
+                          .component = 0,
+                          .src_type = nir_intrinsic_src_type(store),
+                          .io_semantics = sem);
+      }
+   }
+
+   nir_progress(true, impl, nir_metadata_none);
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   return true;
+}
+
 static void
 kk_lower_fs_blend(nir_shader *nir,
                   const struct vk_graphics_pipeline_state *state)
@@ -486,6 +621,7 @@ kk_lower_fs_blend(nir_shader *nir,
    }
    /* Fold constant offset srcs for IO. */
    NIR_PASS(_, nir, nir_opt_constant_folding);
+   NIR_PASS(_, nir, kk_nir_merge_split_color_outputs);
    NIR_PASS(_, nir, nir_lower_blend, &opts);
 }
 

@@ -13,6 +13,12 @@
 #include <Metal/MTL4RenderPipeline.h>
 #include <Metal/MTLDevice.h>
 
+#include <limits.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
 /* Compiler */
 mtl_compiler *
 mtl_new_compiler(mtl_device *device)
@@ -58,6 +64,19 @@ mtl_new_library(mtl_compiler *compiler, const char *src,
 
       if (lib == nil) {
          fprintf(stderr, "Failed to create MTLLibrary: %s\n", [error.localizedDescription UTF8String]);
+
+         const char *dir = getenv("MESA_KK_FAILED_MSL_DIR");
+         if (dir) {
+            static _Atomic uint32_t count;
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path), "%s/%d-%u.metal", dir, getpid(), count++);
+            FILE *f = fopen(path, "w");
+            if (f) {
+               fputs(src, f);
+               fclose(f);
+               fprintf(stderr, "MSL written to %s\n", path);
+            }
+         }
       }
 
       return lib;

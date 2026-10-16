@@ -9,6 +9,7 @@
 
 #include "kk_entrypoints.h"
 #include "kk_physical_device.h"
+#include "kk_shader.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
 #include "kosmickrisp/bridge/vk_to_mtl_map.h"
@@ -126,7 +127,7 @@ create_sampler_descriptor(const struct kk_device *dev,
    mtl_sampler_descriptor_set_compare_function(descriptor,
                                                packed->compare_func);
 
-   if (pdev->vk.supported_extensions.EXT_sampler_filter_minmax)
+   if (kk_has_native_sampler_minmax(pdev))
       mtl_sampler_descriptor_set_reduction_mode(descriptor,
                                                 packed->reduction_mode);
 
@@ -236,6 +237,30 @@ kk_CreateSampler(VkDevice device, const VkSamplerCreateInfo *pCreateInfo,
    sampler->lod_bias_fp16 = _mesa_float_to_half(pCreateInfo->mipLodBias);
    sampler->lod_min_fp16 = _mesa_float_to_half(pCreateInfo->minLod);
    sampler->lod_max_fp16 = _mesa_float_to_half(pCreateInfo->maxLod);
+
+   const VkSamplerReductionModeCreateInfo *reduction_info =
+      vk_find_struct_const(pCreateInfo->pNext,
+                           SAMPLER_REDUCTION_MODE_CREATE_INFO);
+   if (reduction_info && !kk_has_native_sampler_minmax(kk_device_physical(dev)) &&
+       reduction_info->reductionMode !=
+          VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE) {
+      sampler->minmax_flags =
+         (reduction_info->reductionMode == VK_SAMPLER_REDUCTION_MODE_MIN
+             ? KK_SAMPLER_MINMAX_MIN
+             : KK_SAMPLER_MINMAX_MAX) |
+         (pCreateInfo->minFilter == VK_FILTER_LINEAR
+             ? KK_SAMPLER_MINMAX_MIN_LINEAR
+             : 0) |
+         (pCreateInfo->magFilter == VK_FILTER_LINEAR
+             ? KK_SAMPLER_MINMAX_MAG_LINEAR
+             : 0) |
+         (pCreateInfo->mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR
+             ? KK_SAMPLER_MINMAX_MIP_LINEAR
+             : 0) |
+         (pCreateInfo->unnormalizedCoordinates
+             ? KK_SAMPLER_MINMAX_UNNORMALIZED
+             : 0);
+   }
 
    *pSampler = kk_sampler_to_handle(sampler);
 

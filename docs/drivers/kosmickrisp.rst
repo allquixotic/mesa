@@ -83,6 +83,7 @@ KosmicKrisp specific environment variables:
   - ``custom_border`` to advertise ``VK_EXT_custom_border_color`` and ``VK_EXT_border_color_swizzle``.
   - ``image_view_min_lod`` to advertise ``VK_EXT_image_view_min_lod``.
   - ``m5_optimize_e5r9g9b9`` to use allowGPUOptimizedContents on M5 with this format, which causes some CTS tests for vkCmdCopyImage() to fail
+  - ``dgc`` to advertise ``VK_EXT_device_generated_commands``.
 
 Metal workarounds
 *****************

@@ -141,11 +141,12 @@ The existing present-time throttle is too late to protect application writes
 between acquisition and presentation. The wait shares the acquire timeout;
 a timeout leaves the image index and fetched drawable unchanged.
 
-The Enshrouded comparison still times out with this image-reuse correction.
-The successful local profile uses the diagnostic build with ICB, narrow compute
-barriers, and the private presentation queue all disabled. The private-queue
-crash remains under investigation; the image-reuse change is not a verified fix
-for it.
+The image-reuse correction alone did not resolve Enshrouded's timeout.
+A later profile with the private queue, draw clears and serialized Metal
+compilation loaded with good reported gameplay performance. This is a temporary
+per-game workaround; the root cause remains under investigation. See
+:doc:`kosmickrisp/enshrouded-investigation` for the exact profile, controlled
+comparisons, validation limits and unresolved pipeline-cache problem.
 
 ``MESA_KK_TRACE_QUEUE=1`` enables a bounded flight recorder of the last 1024
 Metal commit, event-wait/signal, and drawable-wait/signal operations. On the
@@ -175,6 +176,17 @@ BLAKE3 hashes and entry-point names. Setting ``MESA_KK_PROGRESS_SHADER_DIR`` to
 an existing directory also captures generated sources there, deduplicated by
 hash and limited to 256 MiB per process. It never overwrites an existing file.
 This optional capture does not change shader source or compiler options.
+
+``MESA_KK_SERIALIZE_COMPILATION=1`` serializes synchronous Metal library,
+compute-pipeline and render-pipeline creation with a process-wide mutex.
+This is an opt-in diagnostic/workaround candidate for a workload whose GPU
+timeout depends on shader-source capture. It does not establish that concurrent
+Metal compilation is invalid or defective. Shader source, compiler options,
+and draw/dispatch behavior stay unchanged. Shader compilation may take longer;
+there is no per-frame GPU instrumentation or submission wait added by this option.
+The default remains concurrent compilation. For Enshrouded, scope this setting
+to its executable through Wine's compatibility database rather than exporting
+it globally.
 
 ``MESA_KK_DRAW_COLOR_CLEAR=1`` is an experimental alternative for
 ``vkCmdClearColorImage`` on single-sample 2D renderable color images, including

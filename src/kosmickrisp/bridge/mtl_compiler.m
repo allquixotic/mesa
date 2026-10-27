@@ -8,6 +8,7 @@
 #include "mtl_format.h"
 #include "mtl_progress.h"
 #include "util/mesa-blake3.h"
+#include "util/u_debug.h"
 
 #include <Metal/MTL4ComputePipeline.h>
 #include <Metal/MTL4LibraryDescriptor.h>
@@ -23,6 +24,30 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+
+/* Opt-in diagnostic/workaround candidate. Source capture after library
+ * compilation changes whether one observed workload hangs. Serializing the
+ * synchronous Metal compiler entry points tests a possible concurrency/timing
+ * dependency without shader dumps, GPU counters, or changes to shader code.
+ * Metal permits concurrent compilation; this does not establish an API misuse
+ * or a compiler bug. Keep the normal concurrent path as the default. */
+DEBUG_GET_ONCE_BOOL_OPTION(kk_serialize_compilation,
+                           "MESA_KK_SERIALIZE_COMPILATION", false)
+static pthread_mutex_t kk_compilation_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void
+mtl_compilation_lock(void)
+{
+   if (debug_get_option_kk_serialize_compilation())
+      pthread_mutex_lock(&kk_compilation_mutex);
+}
+
+static void
+mtl_compilation_unlock(void)
+{
+   if (debug_get_option_kk_serialize_compilation())
+      pthread_mutex_unlock(&kk_compilation_mutex);
+}
 
 /* Diagnostic-only source identities survive pipeline/library object reuse.
  * Save each distinct generated source once, with a per-process byte budget.
@@ -135,7 +160,9 @@ mtl_new_library(mtl_compiler *compiler, const char *src,
       desc.options = opts;
 
       NSError *error;
+      mtl_compilation_lock();
       id<MTLLibrary> lib = [comp newLibraryWithDescriptor:desc error:&error];
+      mtl_compilation_unlock();
       mtl_progress_library(lib, src);
 
       if (lib == nil) {
@@ -189,8 +216,10 @@ mtl_new_compute_pipeline_state(mtl_compiler *compiler,
          desc.label = mtl_progress_function_label((MTL4FunctionDescriptor *)function);
 
       NSError *error;
+      mtl_compilation_lock();
       id<MTLComputePipelineState> pipeline = [comp newComputePipelineStateWithDescriptor:desc compilerTaskOptions:nil
                                                                                    error:&error];
+      mtl_compilation_unlock();
 
       if (pipeline == nil) {
          fprintf(stderr, "Failed to create MTLComputePipelineState: %s\n", [error.localizedDescription UTF8String]);
@@ -343,8 +372,10 @@ mtl_new_render_pipeline(mtl_compiler *compiler, mtl_render_pass_descriptor *desc
             mtl_progress_function_label(desc.fragmentFunctionDescriptor)];
 
       NSError *error = nil;
+      mtl_compilation_lock();
       id<MTLRenderPipelineState> pipeline = [comp newRenderPipelineStateWithDescriptor:desc compilerTaskOptions:nil
                                                                                  error:&error];
+      mtl_compilation_unlock();
 
       if (pipeline == nil) {
          fprintf(stderr, "Failed to create MTLRenderPipelineState: %s\n", [error.localizedDescription UTF8String]);

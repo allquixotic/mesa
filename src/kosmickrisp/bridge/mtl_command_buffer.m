@@ -5,6 +5,7 @@
  */
 
 #include "mtl_command_buffer.h"
+#include "mtl_progress.h"
 
 #include <Metal/MTL4BufferRange.h>
 #include <Metal/MTL4CommandAllocator.h>
@@ -28,6 +29,7 @@ mtl_begin_command_buffer(mtl_command_buffer *command_buffer,
       id<MTL4CommandBuffer> cmd_buf = (id<MTL4CommandBuffer>)command_buffer;
       id<MTL4CommandAllocator> alloc = (id<MTL4CommandAllocator>)allocator;
       [cmd_buf beginCommandBufferWithAllocator:alloc];
+      mtl_progress_begin(cmd_buf);
    }
 }
 

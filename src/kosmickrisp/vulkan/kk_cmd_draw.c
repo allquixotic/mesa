@@ -2728,10 +2728,176 @@ kk_stats_draw(struct kk_cmd_buffer *cmd, const struct kk_draw_command *data)
    }
 }
 
+DEBUG_GET_ONCE_BOOL_OPTION(kk_exact_icb, "MESA_KK_EXACT_ICB", true)
+DEBUG_GET_ONCE_BOOL_OPTION(kk_diagnostics, "MESA_KK_DIAGNOSTICS", false)
+
+static bool
+kk_init_indirect_pipelines(struct kk_device *dev)
+{
+   simple_mtx_lock(&dev->icb_mutex);
+   if (!dev->icb_attempted) {
+      dev->icb_attempted = true;
+      mtl_library *lib = mtl_new_indirect_draw_library(dev->mtl_compiler_handle);
+      if (lib) {
+         mtl_function_descriptor *prepare =
+            mtl_new_library_function_descriptor(lib, "prepare");
+         mtl_function_descriptor *generate =
+            mtl_new_library_function_descriptor(lib, "generate");
+         dev->icb_prepare = mtl_new_compute_pipeline_state(dev->mtl_compiler_handle,
+                                                           prepare, 1);
+         dev->icb_generate = mtl_new_compute_pipeline_state(dev->mtl_compiler_handle,
+                                                            generate, 64);
+         mtl_release(prepare);
+         mtl_release(generate);
+         mtl_release(lib);
+      }
+   }
+   bool available = dev->icb_prepare && dev->icb_generate;
+   simple_mtx_unlock(&dev->icb_mutex);
+   return available;
+}
+
+/* Exact, GPU-counted multi-draw. Unsupported state uses the existing path,
+ * without changing the Vulkan count, index-robustness, or shader contracts. */
+static bool
+kk_try_indirect_commands(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
+                          const struct kk_draw_roots *roots)
+{
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+   if (!debug_get_option_kk_exact_icb() || !data->indirect || roots ||
+       /* Avoid ICB setup overhead on small batches; large capacities fall
+        * back instead of imposing a limit on the application's draws. */
+       data->draw_count < 1024 || data->draw_count > 65536 ||
+       cmd->state.shaders[MESA_SHADER_TESS_EVAL] || kk_gs_info(cmd) ||
+       cmd->state.stats.active ||
+       cmd->state.gfx.render.view_mask || cmd->state.gfx.xfb.offsets ||
+       cmd->state.gfx.occlusion.mode != MTL_VISIBILITY_RESULT_MODE_DISABLED ||
+       requires_unroll(cmd, data) || mesa_prim_has_adjacency(data->prim))
+      return false;
+
+   /* GPU-encoded Metal indexed commands have no index-buffer length. Keep
+    * all robust indexed draws on KK's existing bounded/emulated path. */
+   if (data->indexed && (dev->vk.enabled_features.robustBufferAccess ||
+                        dev->vk.enabled_features.robustBufferAccess2 ||
+                        dev->vk.enabled_features.pipelineRobustness))
+      return false;
+
+   struct mtl_indirect_draw_args args = {
+      .draws = data->indirect_command.addr,
+      .indices = data->index_buffer.addr,
+      .root = cmd->state.root_addr,
+      .samplers = dev->samplers.table.bo->gpu,
+      .max_draws = data->draw_count,
+      .stride = data->indirect_command.stride / sizeof(uint32_t),
+      .primitive = mesa_prim_to_mtl_primitive_type(data->prim),
+      .index_size = data->indexed ? data->index_buffer_el_size_B : 0,
+   };
+   for (unsigned i = 0; i < data->predicate_count; i++) {
+      switch (data->predicate_op[i]) {
+      case KK_PREDICATE_GT_DRAW_ID:
+         if (args.count)
+            return false;
+         args.count = data->predicate_addr[i];
+         break;
+      case KK_PREDICATE_EQ_ZERO:
+      case KK_PREDICATE_NEQ_ZERO:
+         if (args.conditional)
+            return false;
+         args.conditional = data->predicate_addr[i];
+         args.conditional_mode = data->predicate_op[i] == KK_PREDICATE_NEQ_ZERO ? 1 : 2;
+         break;
+      default:
+         return false;
+      }
+   }
+   if (!kk_init_indirect_pipelines(dev))
+      return false;
+
+   struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+   mtl_render_pipeline_state *indirect_pipeline =
+      kk_shader_get_indirect_pipeline(dev, vs);
+   if (!indirect_pipeline)
+      return false;
+
+   uint32_t slot = cmd->indirect_buffers_used;
+   if (slot == util_dynarray_num_elements(&cmd->indirect_buffers, struct kk_indirect_buffer)) {
+      struct kk_indirect_buffer empty = {0};
+      util_dynarray_append(&cmd->indirect_buffers, empty);
+   }
+   struct kk_indirect_buffer *cached =
+      util_dynarray_element(&cmd->indirect_buffers, struct kk_indirect_buffer, slot);
+   if (cached->capacity < data->draw_count) {
+      mtl_indirect_command_buffer *new_icb =
+         mtl_new_indirect_draw_buffer(dev->mtl_handle, data->draw_count);
+      if (!new_icb)
+         return false;
+      simple_mtx_lock(&dev->residency_set.mutex);
+      if (cached->handle) {
+         mtl_residency_set_remove_allocation(dev->residency_set.handle, cached->handle);
+         mtl_release(cached->handle);
+      }
+      mtl_residency_set_add_allocation(dev->residency_set.handle, new_icb);
+      simple_mtx_unlock(&dev->residency_set.mutex);
+      *cached = (struct kk_indirect_buffer){new_icb, data->draw_count};
+   }
+   cmd->indirect_buffers_used++;
+   if (debug_get_option_kk_diagnostics() &&
+       p_atomic_cmpxchg(&dev->diagnostic_icb_seen, 0, 1) == 0)
+      mesa_logi("kk diagnostics: exact ICB path first used: indexed=%u capacity=%u per_draw_mask=0x%x",
+                data->indexed, data->draw_count, data->upload_mask);
+   mtl_indirect_command_buffer *icb = cached->handle;
+   args.icb = mtl_indirect_draw_buffer_id(icb);
+
+   struct kk_ptr execution = kk_pool_alloc(cmd, 5 * sizeof(uint32_t), 8);
+   if (!execution.gpu)
+      return true; /* kk_pool_alloc records the allocation error. */
+   args.range = execution.gpu;
+   args.grid = execution.gpu + 2 * sizeof(uint32_t);
+   if (data->upload_mask) {
+      STATIC_ASSERT(offsetof(struct kk_per_draw_data, draw_id) == 0);
+      struct kk_per_draw_data per_draw = cmd->state.gfx.per_draw_data;
+      per_draw.fs_invocations = 0;
+      per_draw.provoking_ids = 0;
+      args.per_draw_words = sizeof(per_draw) / sizeof(uint32_t);
+      args.per_draw_template = kk_pool_upload(cmd, &per_draw, sizeof(per_draw), 8).gpu;
+      args.per_draw = kk_pool_alloc(cmd, (size_t)data->draw_count * sizeof(per_draw), 8).gpu;
+      if (!args.per_draw_template || !args.per_draw)
+         return true;
+   }
+   struct kk_ptr params = kk_pool_upload(cmd, &args, sizeof(args), 8);
+   if (!params.gpu)
+      return true;
+
+   mtl_compute_encoder *enc = cs_get_compute(cmd);
+   mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH | MTL_STAGE_BLIT,
+                                    MTL_STAGE_DISPATCH);
+   mtl_set_address(cmd->argument_table, params.gpu, 0);
+   mtl_compute_set_pipeline_state(enc, dev->icb_prepare);
+   mtl_dispatch_threads(enc, (struct mtl_size){1, 1, 1}, (struct mtl_size){1, 1, 1});
+   mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH, MTL_STAGE_DISPATCH);
+   mtl_compute_set_pipeline_state(enc, dev->icb_generate);
+   mtl_dispatch_threadgroups_with_indirect_buffer(enc, args.grid,
+                                                  (struct mtl_size){64, 1, 1});
+   mtl_set_address(cmd->argument_table, cmd->state.root_addr, 0);
+
+   /* The normal encoder transition publishes ICB writes and per-draw data
+    * before the render encoder consumes them. */
+   kk_flush_gfx_state(cmd);
+   mtl_render_encoder *render = cs_get_render(cmd);
+   mtl_render_set_pipeline_state(render, indirect_pipeline);
+   mtl_execute_indirect_draws(render, icb, args.range);
+   /* An ordinary draw may follow without a shader-state change. */
+   mtl_render_set_pipeline_state(render, vs->pipeline.gfx.render);
+   return true;
+}
+
 static void
 kk_draw_flushed(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
                 const struct kk_draw_roots *roots)
 {
+   if (kk_try_indirect_commands(cmd, data, roots))
+      return;
+
    /* Convert to indirect and process predicates. Skip draw if we fail. */
    if (data->predicate_count > 0 && !kk_predicate_draws(cmd, data))
       return;

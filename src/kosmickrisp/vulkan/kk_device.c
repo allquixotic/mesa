@@ -262,6 +262,10 @@ kk_device_lock_atomic64(struct kk_device *dev, uint32_t classes)
    simple_mtx_lock(&dev->atomic64.lock);
    if (dev->has_queue)
       kk_queue_wait_for_idle(&dev->queue);
+   simple_mtx_lock(&dev->blit_queue_mutex);
+   if (dev->has_blit_queue)
+      kk_queue_wait_for_idle(&dev->blit_queue);
+   simple_mtx_unlock(&dev->blit_queue_mutex);
    uint32_t *flags = dev->atomic64.bo->cpu;
    u_foreach_bit(c, classes)
       p_atomic_set(&flags[c], 1u);
@@ -339,6 +343,8 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (dev->residency_set.handle == NULL)
       goto fail_compiler;
 
+   simple_mtx_init(&dev->blit_queue_mutex, mtx_plain);
+   simple_mtx_init(&dev->icb_mutex, mtx_plain);
    if (pCreateInfo->queueCreateInfoCount > 0) {
       result =
          kk_queue_init(dev, &dev->queue, &pCreateInfo->pQueueCreateInfos[0], 0);
@@ -417,6 +423,8 @@ fail_mem_cache:
       dev->has_queue = false;
    }
 fail_vab_memory:
+   simple_mtx_destroy(&dev->icb_mutex);
+   simple_mtx_destroy(&dev->blit_queue_mutex);
    mtl_release(dev->residency_set.handle);
    simple_mtx_destroy(&dev->residency_set.mutex);
 fail_compiler:
@@ -446,7 +454,13 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    if (dev->has_queue)
       kk_queue_wait_for_idle(&dev->queue);
 
+   if (dev->has_blit_queue)
+      kk_queue_wait_for_idle(&dev->blit_queue);
+
    /* Meta first since it may destroy Vulkan objects */
+   mtl_release(dev->icb_prepare);
+   mtl_release(dev->icb_generate);
+   simple_mtx_destroy(&dev->icb_mutex);
    kk_device_finish_meta(dev);
    kk_device_finish_lib(dev);
    kk_query_table_finish(dev, &dev->occlusion_queries);
@@ -460,6 +474,11 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    kk_destroy_bo(dev, dev->atomic64.bo);
    kk_device_finish_sparse_residency(dev);
 
+   if (dev->has_blit_queue) {
+      kk_queue_finish(dev, &dev->blit_queue);
+      dev->has_blit_queue = false;
+   }
+   simple_mtx_destroy(&dev->blit_queue_mutex);
    if (dev->has_queue) {
       kk_queue_finish(dev, &dev->queue);
       dev->has_queue = false;

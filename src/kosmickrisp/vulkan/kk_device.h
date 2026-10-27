@@ -99,6 +99,13 @@ struct kk_device {
 
    bool has_queue;
    struct kk_queue queue;
+   simple_mtx_t blit_queue_mutex;
+   bool has_blit_queue;
+   struct kk_queue blit_queue;
+   simple_mtx_t icb_mutex;
+   bool icb_attempted;
+   mtl_compute_pipeline_state *icb_prepare, *icb_generate;
+   uint32_t diagnostic_icb_seen;
 
    struct vk_meta_device meta;
 

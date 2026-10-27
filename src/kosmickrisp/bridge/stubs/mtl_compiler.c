@@ -43,7 +43,7 @@ mtl_new_compute_pipeline_state(mtl_compiler *compiler,
 
 /* Render pipeline descriptor */
 mtl_render_pipeline_descriptor *
-mtl_new_render_pipeline_descriptor(void)
+mtl_new_render_pipeline_descriptor(bool indirect)
 {
    return NULL;
 }

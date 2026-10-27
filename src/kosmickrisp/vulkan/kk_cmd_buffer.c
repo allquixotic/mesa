@@ -38,6 +38,19 @@ kk_descriptor_state_fini(struct kk_cmd_buffer *cmd,
 }
 
 static void
+kk_cmd_release_indirect_buffers(struct kk_device *dev, struct kk_cmd_buffer *cmd)
+{
+   simple_mtx_lock(&dev->residency_set.mutex);
+   util_dynarray_foreach(&cmd->indirect_buffers, struct kk_indirect_buffer, icb) {
+      mtl_residency_set_remove_allocation(dev->residency_set.handle, icb->handle);
+      mtl_release(icb->handle);
+   }
+   simple_mtx_unlock(&dev->residency_set.mutex);
+   util_dynarray_clear(&cmd->indirect_buffers);
+   cmd->indirect_buffers_used = 0;
+}
+
+static void
 kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
 {
    struct kk_cmd_pool *pool = kk_cmd_buffer_pool(cmd);
@@ -53,6 +66,9 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
       kk_destroy_bo(dev, *bo);
    }
    util_dynarray_clear(&cmd->large_bos);
+   /* Reset only runs when this command buffer is no longer in flight.
+    * Retain ICB allocations for the next recording, just like pooled BOs. */
+   cmd->indirect_buffers_used = 0;
    util_dynarray_clear(&cmd->post_render_writes);
    util_dynarray_clear(&cmd->post_render_stats);
    util_dynarray_clear(&cmd->ts_resolves);
@@ -94,7 +110,9 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
 
    kk_cmd_release_resources(dev, cmd);
+   kk_cmd_release_indirect_buffers(dev, cmd);
    util_dynarray_fini(&cmd->large_bos);
+   util_dynarray_fini(&cmd->indirect_buffers);
    util_dynarray_fini(&cmd->post_render_writes);
    util_dynarray_fini(&cmd->post_render_stats);
    util_dynarray_fini(&cmd->ts_resolves);
@@ -143,6 +161,7 @@ kk_create_cmd_buffer(struct vk_command_pool *vk_pool,
    }
 
    cmd->large_bos = UTIL_DYNARRAY_INIT;
+   cmd->indirect_buffers = UTIL_DYNARRAY_INIT;
 
    cmd->vk.dynamic_graphics_state.vi = &cmd->state.gfx._dynamic_vi;
    cmd->vk.dynamic_graphics_state.ms.sample_locations =
@@ -178,12 +197,14 @@ kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd)
 
 static void
 kk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
-                    UNUSED VkCommandBufferResetFlags flags)
+                    VkCommandBufferResetFlags flags)
 {
    struct kk_cmd_buffer *cmd =
       container_of(vk_cmd_buffer, struct kk_cmd_buffer, vk);
 
    kk_reset_cmd_buffer_internal(cmd);
+   if (flags & VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT)
+      kk_cmd_release_indirect_buffers(kk_cmd_buffer_device(cmd), cmd);
    vk_command_buffer_reset(&cmd->vk);
    cmd->submitted = false;
    cmd->one_time_submit = false;
@@ -530,6 +551,9 @@ kk_barrier_requires_encoder_split(struct kk_cmd_buffer *cmd,
           (dst & VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
 }
 
+DEBUG_GET_ONCE_BOOL_OPTION(kk_narrow_compute_barriers,
+                           "MESA_KK_NARROW_COMPUTE_BARRIERS", true)
+
 VKAPI_ATTR void VKAPI_CALL
 kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
                        const VkDependencyInfo *pDependencyInfo)
@@ -553,12 +577,42 @@ kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
          mtl_barrier_after_encoder_stages(cmd->metal.render, MTL_STAGE_VERTEX,
                                           MTL_STAGE_FRAGMENT);
    } else if (cmd->metal.compute) {
+      if (!debug_get_option_kk_narrow_compute_barriers()) {
+         mtl_barrier_after_encoder_stages(cmd->metal.compute,
+                                          MTL_STAGE_DISPATCH | MTL_STAGE_BLIT,
+                                          MTL_STAGE_DISPATCH | MTL_STAGE_BLIT);
+         return;
+      }
       /* We chain encoders, so an intra-encoder barrier is enough here:
        * no need to tear down and recreate the encoder.
        */
-      mtl_barrier_after_encoder_stages(cmd->metal.compute,
-                                       MTL_STAGE_DISPATCH | MTL_STAGE_BLIT,
-                                       MTL_STAGE_DISPATCH | MTL_STAGE_BLIT);
+      VkPipelineStageFlags2 src = 0, dst = 0;
+      for (uint32_t i = 0; i < pDependencyInfo->memoryBarrierCount; i++) {
+         src |= pDependencyInfo->pMemoryBarriers[i].srcStageMask;
+         dst |= pDependencyInfo->pMemoryBarriers[i].dstStageMask;
+      }
+      for (uint32_t i = 0; i < pDependencyInfo->bufferMemoryBarrierCount; i++) {
+         src |= pDependencyInfo->pBufferMemoryBarriers[i].srcStageMask;
+         dst |= pDependencyInfo->pBufferMemoryBarriers[i].dstStageMask;
+      }
+      for (uint32_t i = 0; i < pDependencyInfo->imageMemoryBarrierCount; i++) {
+         src |= pDependencyInfo->pImageMemoryBarriers[i].srcStageMask;
+         dst |= pDependencyInfo->pImageMemoryBarriers[i].dstStageMask;
+      }
+      /* A pure Vulkan compute scope maps to Metal dispatch. TOP in a source
+       * scope and BOTTOM in a destination scope contribute no work, but must
+       * not erase other bits. Keep transfer/meta, host, indirect, empty and
+       * unknown scopes conservative, including resource-alias visibility and
+       * all cross-encoder dependencies. */
+      src &= ~VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+      dst &= ~VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
+      enum mtl_stages after = src == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                                ? MTL_STAGE_DISPATCH
+                                : MTL_STAGE_DISPATCH | MTL_STAGE_BLIT;
+      enum mtl_stages before = dst == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                                 ? MTL_STAGE_DISPATCH
+                                 : MTL_STAGE_DISPATCH | MTL_STAGE_BLIT;
+      mtl_barrier_after_encoder_stages(cmd->metal.compute, after, before);
    }
 }
 

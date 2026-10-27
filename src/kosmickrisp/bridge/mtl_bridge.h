@@ -30,6 +30,7 @@
 #include "mtl_encoder.h"
 #include "mtl_format.h"
 #include "mtl_heap.h"
+#include "mtl_indirect.h"
 #include "mtl_render_state.h"
 #include "mtl_residency_set.h"
 #include "mtl_sampler.h"

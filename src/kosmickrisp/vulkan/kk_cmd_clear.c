@@ -10,12 +10,16 @@
 
 #include "kk_device.h"
 #include "kk_entrypoints.h"
+#include "kk_format.h"
 #include "kk_image.h"
 #include "kk_image_view.h"
 #include "kk_physical_device.h"
 
 #include "vk_format.h"
 #include "vk_meta.h"
+#include "util/u_debug.h"
+
+DEBUG_GET_ONCE_BOOL_OPTION(kk_draw_color_clear, "MESA_KK_DRAW_COLOR_CLEAR", false)
 
 static VkImageViewType
 render_view_type(VkImageType image_type, unsigned layer_count)
@@ -42,6 +46,17 @@ clear_image(struct kk_cmd_buffer *cmd, struct kk_image *image,
 {
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
    ASSERTED VkResult result;
+   /* Opt-in alternative to the empty load-action clear pass. Use the existing
+    * meta attachment-clear implementation, including its state/query save and
+    * restore. Restrict the experiment to single-sample 2D renderable color
+    * images; other paths retain the established implementation. No texels or
+    * subresources are skipped. */
+   const struct kk_va_format *va_format =
+      kk_get_va_format(vk_format_to_pipe_format(format));
+   const bool draw_clear = debug_get_option_kk_draw_color_clear() &&
+                           image->vk.image_type == VK_IMAGE_TYPE_2D &&
+                           image->vk.samples == 1 && va_format && va_format->color &&
+                           image->vk.aspects == VK_IMAGE_ASPECT_COLOR_BIT;
 
    for (uint32_t r = 0; r < range_count; r++) {
       const uint32_t level_count =
@@ -106,7 +121,8 @@ clear_image(struct kk_cmd_buffer *cmd, struct kk_image *image,
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .imageView = view,
             .imageLayout = image_layout,
-            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .loadOp = draw_clear ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+                                 : VK_ATTACHMENT_LOAD_OP_CLEAR,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
             .clearValue = *clear_value,
          };
@@ -121,6 +137,25 @@ clear_image(struct kk_cmd_buffer *cmd, struct kk_image *image,
             render.pStencilAttachment = &vk_att;
 
          kk_CmdBeginRendering(kk_cmd_buffer_to_handle(cmd), &render);
+
+         if (draw_clear) {
+            const VkClearAttachment attachment = {
+               .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+               .colorAttachment = 0,
+               .clearValue = *clear_value,
+            };
+            const VkClearRect rect = {
+               .rect = render.renderArea,
+               .baseArrayLayer = 0,
+               .layerCount = layer_count,
+            };
+            /* CmdClearColorImage is unconditional, unlike ClearAttachments. */
+            const bool conditional = cmd->state.cond_render.enabled;
+            cmd->state.cond_render.enabled = false;
+            kk_CmdClearAttachments(kk_cmd_buffer_to_handle(cmd), 1, &attachment,
+                                    1, &rect);
+            cmd->state.cond_render.enabled = conditional;
+         }
 
          static const VkRenderingEndInfoKHR end_info = {
             .sType = VK_STRUCTURE_TYPE_RENDERING_END_INFO_KHR,

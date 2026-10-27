@@ -306,6 +306,11 @@ struct kk_ts_stage_entry {
    uint32_t index;
 };
 
+struct kk_indirect_buffer {
+   void *handle;
+   uint32_t capacity;
+};
+
 struct kk_cmd_buffer {
    struct vk_command_buffer vk;
 
@@ -344,6 +349,8 @@ struct kk_cmd_buffer {
 
    /* Owned large BOs */
    struct util_dynarray large_bos;
+   struct util_dynarray indirect_buffers;
+   uint32_t indirect_buffers_used;
 
    /* Does the command buffer use the geometry heap? */
    bool uses_heap;

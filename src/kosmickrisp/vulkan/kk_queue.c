@@ -20,6 +20,29 @@
 #include "kosmickrisp/bridge/vk_to_mtl_map.h"
 
 #include "vk_cmd_queue.h"
+#include "vk_common_entrypoints.h"
+
+VKAPI_ATTR VkResult VKAPI_CALL
+kk_QueueWaitIdle(VkQueue _queue)
+{
+   VK_FROM_HANDLE(vk_queue, vk_queue, _queue);
+   struct kk_queue *queue = container_of(vk_queue, struct kk_queue, vk);
+   struct kk_device *dev = kk_queue_device(queue);
+   VkResult result = vk_common_QueueWaitIdle(_queue);
+   if (result != VK_SUCCESS)
+      return result;
+
+   /* Presentation submitted through the public queue may still have a blit
+    * pending on our private queue. Preserve the public idle contract without
+    * serializing that work during normal rendering. */
+   if (queue == &dev->queue) {
+      simple_mtx_lock(&dev->blit_queue_mutex);
+      if (dev->has_blit_queue)
+         result = vk_common_QueueWaitIdle(vk_queue_to_handle(&dev->blit_queue.vk));
+      simple_mtx_unlock(&dev->blit_queue_mutex);
+   }
+   return result;
+}
 
 struct kk_commit_data {
    struct kk_queue *queue;
@@ -52,11 +75,13 @@ kk_queue_release_cmd_buffer_locked(struct kk_queue *queue,
 }
 
 static void
-check_device_lost(struct kk_device *dev, struct mtl_feedback_data *data)
+check_device_lost(struct kk_queue *queue, struct mtl_feedback_data *data)
 {
+   struct kk_device *dev = kk_queue_device(queue);
    if (data->error != MTL_COMMAND_QUEUE_ERROR_NONE) {
       vk_device_set_lost(
-         &dev->vk, "Command queue error: %s, with message \"%s\"",
+         &dev->vk, "%s command queue error: %s, with message \"%s\"",
+         queue == &dev->blit_queue ? "Presentation" : "Application",
          mtl_command_queue_error_to_string(data->error), data->error_message);
       memset((uint8_t *)dev->atomic64.bo->cpu + KK_ATOMIC64_LOCK_OFFSET, 0,
              KK_ATOMIC64_ARENA_SIZE - KK_ATOMIC64_LOCK_OFFSET);
@@ -71,12 +96,12 @@ check_device_lost(struct kk_device *dev, struct mtl_feedback_data *data)
 static void
 commit_callback(struct mtl_feedback_data *data)
 {
-   struct kk_device *dev = (struct kk_device *)data->user_data;
-   check_device_lost(dev, data);
+   struct kk_queue *queue = data->user_data;
+   check_device_lost(queue, data);
 
-   mtx_lock(&dev->queue.mutex);
-   kk_queue_work_done_locked(&dev->queue);
-   mtx_unlock(&dev->queue.mutex);
+   mtx_lock(&queue->mutex);
+   kk_queue_work_done_locked(queue);
+   mtx_unlock(&queue->mutex);
 }
 
 static void
@@ -86,7 +111,7 @@ rerecord_commit_callback(struct mtl_feedback_data *data)
    struct kk_queue *queue = commit->queue;
    struct kk_device *dev = kk_queue_device(queue);
 
-   check_device_lost(dev, data);
+   check_device_lost(queue, data);
 
    /* Completion callbacks are called from multiple threads, so we need to
     * ensure the access to queue resources is safe. */
@@ -518,7 +543,7 @@ kk_queue_submit_locked(struct kk_queue *queue, struct vk_queue_submit *submit)
          mtx_lock(&queue->mutex);
          queue->work_in_flight++;
          mtx_unlock(&queue->mutex);
-         kk_queue_commit(queue, cmd_buffer, commit_callback, dev);
+         kk_queue_commit(queue, cmd_buffer, commit_callback, queue);
       }
 
       cmd_buffer->submitted = true;

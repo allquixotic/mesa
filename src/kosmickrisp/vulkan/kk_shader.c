@@ -1271,6 +1271,9 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
       if (pipe->gfx.render_stats)
          mtl_release(pipe->gfx.render_stats);
       pipe->gfx.render_stats = NULL;
+      if (pipe->gfx.render_indirect)
+         mtl_release(pipe->gfx.render_indirect);
+      pipe->gfx.render_indirect = NULL;
       if (pipe->gfx.ds_handle)
          mtl_release(pipe->gfx.ds_handle);
       pipe->gfx.render = NULL;
@@ -2259,7 +2262,7 @@ gather_graphics_pipeline_create_info(
 
 static mtl_render_pipeline_state *
 kk_new_render_pipeline(struct kk_device *device, struct kk_shader *vs,
-                       const struct msl_compile_data *fs_data)
+                       const struct msl_compile_data *fs_data, bool indirect)
 {
    struct kk_physical_device *pdev = kk_device_physical(device);
    mtl_render_pipeline_state *render = NULL;
@@ -2289,7 +2292,7 @@ kk_new_render_pipeline(struct kk_device *device, struct kk_shader *vs,
                                           fs_data->entrypoint_name);
 
    mtl_render_pipeline_descriptor *pipeline_descriptor =
-      mtl_new_render_pipeline_descriptor();
+      mtl_new_render_pipeline_descriptor(indirect);
    mtl_render_pipeline_descriptor_set_vertex_shader(pipeline_descriptor,
                                                     vertex_function);
    mtl_render_pipeline_descriptor_set_fragment_shader(pipeline_descriptor,
@@ -2399,7 +2402,7 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
    }
 
    pipe->gfx.render = kk_new_render_pipeline(
-      device, vs, &vs->msl_data[MESA_SHADER_FRAGMENT]);
+      device, vs, &vs->msl_data[MESA_SHADER_FRAGMENT], false);
    if (pipe->gfx.render == NULL)
       result = VK_ERROR_INVALID_SHADER_NV;
 
@@ -2413,12 +2416,34 @@ kk_shader_get_stats_pipeline(struct kk_device *dev, struct kk_shader *vs)
    if (render || !vs->info.has_fs_stats)
       return render;
 
-   render = kk_new_render_pipeline(dev, vs, &vs->fs_stats);
+   render = kk_new_render_pipeline(dev, vs, &vs->fs_stats, false);
    if (render == NULL)
       return NULL;
 
    mtl_render_pipeline_state *old =
       p_atomic_cmpxchg(&vs->pipeline.gfx.render_stats, NULL, render);
+   if (old) {
+      mtl_release(render);
+      return old;
+   }
+   return render;
+}
+
+mtl_render_pipeline_state *
+kk_shader_get_indirect_pipeline(struct kk_device *dev, struct kk_shader *vs)
+{
+   mtl_render_pipeline_state *render =
+      p_atomic_read(&vs->pipeline.gfx.render_indirect);
+   if (render)
+      return render;
+
+   render = kk_new_render_pipeline(
+      dev, vs, &vs->msl_data[MESA_SHADER_FRAGMENT], true);
+   if (render == NULL)
+      return NULL;
+
+   mtl_render_pipeline_state *old =
+      p_atomic_cmpxchg(&vs->pipeline.gfx.render_indirect, NULL, render);
    if (old) {
       mtl_release(render);
       return old;

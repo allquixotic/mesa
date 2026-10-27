@@ -95,15 +95,36 @@ kk_encode_drawable_present(VkCommandBuffer vk_cmd, void *drawable)
    mtl_command_buffer_use_drawable_residency(cmd->metal.cmd_buf, drawable);
 }
 
+DEBUG_GET_ONCE_BOOL_OPTION(kk_present_queue, "MESA_KK_PRESENT_QUEUE", true)
+
 static struct vk_queue *
 kk_get_blit_queue(VkDevice device)
 {
-   /* We only have one queue, so just return that one. */
    VK_FROM_HANDLE(kk_device, dev, device);
    if (!dev->has_queue)
       return NULL;
+   if (!debug_get_option_kk_present_queue())
+      return &dev->queue.vk;
 
-   return &dev->queue.vk;
+   /* Adapted from Mesa MR !45568: waiting for a drawable must not block
+    * unrelated application work on the public queue. */
+   simple_mtx_lock(&dev->blit_queue_mutex);
+   if (!dev->has_blit_queue) {
+      const VkDeviceQueueCreateInfo info = {
+         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+         .queueFamilyIndex = 0,
+         .queueCount = 1,
+      };
+      VkResult result = kk_queue_init(dev, &dev->blit_queue, &info, 0);
+      if (result == VK_SUCCESS)
+         dev->has_blit_queue = true;
+      else
+         mesa_logw("kk: failed to create the WSI queue");
+   }
+   struct vk_queue *queue = dev->has_blit_queue ? &dev->blit_queue.vk
+                                               : &dev->queue.vk;
+   simple_mtx_unlock(&dev->blit_queue_mutex);
+   return queue;
 }
 
 VkResult

@@ -35,7 +35,7 @@ mtl_new_compute_pipeline_state(mtl_compiler *compiler,
                                uint64_t max_total_threads_per_threadgroup);
 
 /* Render pipeline descriptor */
-mtl_render_pipeline_descriptor *mtl_new_render_pipeline_descriptor(void);
+mtl_render_pipeline_descriptor *mtl_new_render_pipeline_descriptor(bool indirect);
 
 void mtl_render_pipeline_descriptor_set_vertex_shader(
    mtl_render_pipeline_descriptor *descriptor, mtl_function_descriptor *shader);

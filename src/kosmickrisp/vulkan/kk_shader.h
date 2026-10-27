@@ -140,6 +140,7 @@ struct kk_pipeline_handles {
       struct {
          mtl_render_pipeline_state *render;
          mtl_render_pipeline_state *render_stats;
+         mtl_render_pipeline_state *render_indirect;
          /* VS, TCS, TES and the GS compute pass at most run before the render
           * pipeline. */
          mtl_compute_pipeline_state *pre_render[4];
@@ -204,6 +205,8 @@ bool kk_nir_lower_poly(struct nir_shader *nir);
 
 mtl_render_pipeline_state *kk_shader_get_stats_pipeline(struct kk_device *dev,
                                                         struct kk_shader *vs);
+mtl_render_pipeline_state *kk_shader_get_indirect_pipeline(struct kk_device *dev,
+                                                           struct kk_shader *vs);
 bool kk_nir_lower_null_images(nir_shader *nir);
 
 bool kk_nir_lower_textures(nir_shader *nir);

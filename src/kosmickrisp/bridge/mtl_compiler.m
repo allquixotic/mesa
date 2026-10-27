@@ -6,6 +6,8 @@
 
 #include "mtl_compiler.h"
 #include "mtl_format.h"
+#include "mtl_progress.h"
+#include "util/mesa-blake3.h"
 
 #include <Metal/MTL4ComputePipeline.h>
 #include <Metal/MTL4LibraryDescriptor.h>
@@ -14,10 +16,83 @@
 #include <Metal/MTLDevice.h>
 
 #include <limits.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+
+/* Diagnostic-only source identities survive pipeline/library object reuse.
+ * Save each distinct generated source once, with a per-process byte budget.
+ * Failure to capture a source must never affect shader compilation. */
+static void
+mtl_progress_library(id<MTLLibrary> lib, const char *src)
+{
+   if (!lib || !mtl_progress_enabled())
+      return;
+
+   const size_t size = strlen(src);
+   blake3_hash hash;
+   char hex[BLAKE3_HEX_LEN];
+   _mesa_blake3_compute(src, size, hash);
+   _mesa_blake3_format(hex, hash);
+   lib.label = [NSString stringWithFormat:@"msl:%s", hex];
+
+   const char *dir = getenv("MESA_KK_PROGRESS_SHADER_DIR");
+   if (!dir || !dir[0])
+      return;
+   char path[PATH_MAX];
+   if (snprintf(path, sizeof(path), "%s/%s.metal", dir, hex) >= sizeof(path))
+      return;
+
+   static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+   static size_t captured;
+   static bool warned;
+   const size_t limit = 256u * 1024u * 1024u;
+   pthread_mutex_lock(&mutex);
+   if (size > limit - captured) {
+      if (!warned)
+         fprintf(stderr, "kk progress: shader capture reached its 256 MiB budget\n");
+      warned = true;
+      pthread_mutex_unlock(&mutex);
+      return;
+   }
+   const int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+   if (fd >= 0) {
+      size_t written = 0;
+      while (written < size) {
+         ssize_t n = write(fd, src + written, size - written);
+         if (n < 0 && errno == EINTR)
+            continue;
+         if (n <= 0)
+            break;
+         written += n;
+      }
+      const int closed = close(fd);
+      if (written == size && closed == 0) {
+         captured += size;
+      } else {
+         unlink(path);
+         fprintf(stderr, "kk progress: incomplete shader capture: %s\n", path);
+      }
+   } else if (errno != EEXIST) {
+      fprintf(stderr, "kk progress: cannot capture shader %s: %s\n", path,
+              strerror(errno));
+   }
+   pthread_mutex_unlock(&mutex);
+}
+
+static NSString *
+mtl_progress_function_label(MTL4FunctionDescriptor *function)
+{
+   if (![function isKindOfClass:[MTL4LibraryFunctionDescriptor class]])
+      return @"unknown";
+   MTL4LibraryFunctionDescriptor *fn = (MTL4LibraryFunctionDescriptor *)function;
+   return [NSString stringWithFormat:@"%@:%@", fn.library.label ?: @"unlabeled",
+                                      fn.name ?: @"unknown"];
+}
 
 /* Compiler */
 mtl_compiler *
@@ -61,6 +136,7 @@ mtl_new_library(mtl_compiler *compiler, const char *src,
 
       NSError *error;
       id<MTLLibrary> lib = [comp newLibraryWithDescriptor:desc error:&error];
+      mtl_progress_library(lib, src);
 
       if (lib == nil) {
          fprintf(stderr, "Failed to create MTLLibrary: %s\n", [error.localizedDescription UTF8String]);
@@ -109,6 +185,8 @@ mtl_new_compute_pipeline_state(mtl_compiler *compiler,
       MTL4ComputePipelineDescriptor *desc = [[MTL4ComputePipelineDescriptor new] autorelease];
       desc.computeFunctionDescriptor = (MTL4FunctionDescriptor *)function;
       desc.maxTotalThreadsPerThreadgroup = max_total_threads_per_threadgroup;
+      if (mtl_progress_enabled())
+         desc.label = mtl_progress_function_label((MTL4FunctionDescriptor *)function);
 
       NSError *error;
       id<MTLComputePipelineState> pipeline = [comp newComputePipelineStateWithDescriptor:desc compilerTaskOptions:nil
@@ -124,10 +202,15 @@ mtl_new_compute_pipeline_state(mtl_compiler *compiler,
 
 /* Render pipeline descriptor */
 mtl_render_pipeline_descriptor *
-mtl_new_render_pipeline_descriptor()
+mtl_new_render_pipeline_descriptor(bool indirect)
 {
    @autoreleasepool {
-      return [MTL4RenderPipelineDescriptor new];
+      MTL4RenderPipelineDescriptor *desc = [MTL4RenderPipelineDescriptor new];
+      /* Ordinary draws keep the upstream descriptor defaults. Only an ICB
+       * pipeline variant opts into indirect-command support. */
+      if (indirect)
+         desc.supportIndirectCommandBuffers = MTL4IndirectCommandBufferSupportStateEnabled;
+      return desc;
    }
 }
 
@@ -253,6 +336,11 @@ mtl_new_render_pipeline(mtl_compiler *compiler, mtl_render_pass_descriptor *desc
    @autoreleasepool {
       id<MTL4Compiler> comp = (id<MTL4Compiler>)compiler;
       MTL4RenderPipelineDescriptor *desc = (MTL4RenderPipelineDescriptor *)descriptor;
+
+      if (mtl_progress_enabled())
+         desc.label = [NSString stringWithFormat:@"vs=%@ fs=%@",
+            mtl_progress_function_label(desc.vertexFunctionDescriptor),
+            mtl_progress_function_label(desc.fragmentFunctionDescriptor)];
 
       NSError *error = nil;
       id<MTLRenderPipelineState> pipeline = [comp newRenderPipelineStateWithDescriptor:desc compilerTaskOptions:nil

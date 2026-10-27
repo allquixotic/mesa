@@ -5,6 +5,7 @@
  */
 
 #include "mtl_encoder.h"
+#include "mtl_progress.h"
 
 #include <Metal/MTL4CommandBuffer.h>
 #include <Metal/MTL4ComputeCommandEncoder.h>
@@ -18,6 +19,7 @@ mtl_end_encoding(void *encoder)
 {
    @autoreleasepool {
       id<MTL4CommandEncoder> enc = (id<MTL4CommandEncoder>)encoder;
+      MTL_PROGRESS(enc, @"end encoder");
       [enc endEncoding];
    }
 }
@@ -122,7 +124,9 @@ mtl_new_compute_command_encoder(mtl_command_buffer *cmd_buffer)
 {
    @autoreleasepool {
       id<MTL4CommandBuffer> cmd_buf = (id<MTL4CommandBuffer>)cmd_buffer;
-      return [[cmd_buf computeCommandEncoder] retain];
+      id<MTL4ComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
+      mtl_progress_attach(cmd_buf, enc, false);
+      return [enc retain];
    }
 }
 
@@ -137,6 +141,7 @@ mtl_copy_from_buffer_to_buffer(mtl_compute_encoder *encoder,
       id<MTLBuffer> mtl_src_buffer = (id<MTLBuffer>)src_buf;
       id<MTLBuffer> mtl_dst_buffer = (id<MTLBuffer>)dst_buf;
       [enc copyFromBuffer:mtl_src_buffer sourceOffset:src_offset toBuffer:mtl_dst_buffer destinationOffset:dst_offset size:size];
+      MTL_PROGRESS(enc, @"copy buffer bytes=%zu src=%p dst=%p", size, src_buf, dst_buf);
    }
 }
 
@@ -160,6 +165,7 @@ mtl_copy_from_buffer_to_texture(mtl_compute_encoder *encoder,
          destinationLevel:data->image_level
         destinationOrigin:origin
                   options:(MTLBlitOption)data->options];
+      MTL_PROGRESS(enc, @"copy buffer->texture %zux%zux%zu", data->image_size.x, data->image_size.y, data->image_size.z);
    }
 }
 
@@ -183,6 +189,7 @@ mtl_copy_from_texture_to_buffer(mtl_compute_encoder *encoder,
     destinationBytesPerRow:data->buffer_stride_B
   destinationBytesPerImage:data->buffer_2d_image_size_B
                    options:(MTLBlitOption)data->options];
+      MTL_PROGRESS(enc, @"copy texture->buffer %zux%zux%zu", data->image_size.x, data->image_size.y, data->image_size.z);
    }
 }
 
@@ -210,6 +217,7 @@ mtl_copy_from_texture_to_texture(mtl_compute_encoder *encoder,
           destinationSlice:dst_slice
           destinationLevel:dst_level
          destinationOrigin:mtl_dst_origin];
+      MTL_PROGRESS(enc, @"copy texture->texture %zux%zux%zu", src_size.x, src_size.y, src_size.z);
    }
 }
 
@@ -221,6 +229,7 @@ mtl_compute_set_pipeline_state(mtl_compute_encoder *encoder,
       id<MTL4ComputeCommandEncoder> enc = (id<MTL4ComputeCommandEncoder>)encoder;
       id<MTLComputePipelineState> state = (id<MTLComputePipelineState>)state_handle;
       [enc setComputePipelineState:state];
+      mtl_progress_pipeline(enc, state);
    }
 }
 
@@ -246,6 +255,7 @@ mtl_dispatch_threads(mtl_compute_encoder *encoder,
                                                     local_size.z);
 
       [enc dispatchThreads:thread_count threadsPerThreadgroup:threads_per_threadgroup];
+      MTL_PROGRESS(enc, @"dispatch direct grid=%zux%zux%zu local=%zux%zux%zu", grid_size.x, grid_size.y, grid_size.z, local_size.x, local_size.y, local_size.z);
    }
 }
 
@@ -261,6 +271,7 @@ mtl_dispatch_threadgroups_with_indirect_buffer(mtl_compute_encoder *encoder,
                                                     local_size.z);
 
       [enc dispatchThreadgroupsWithIndirectBuffer:addr threadsPerThreadgroup:threads_per_threadgroup];
+      MTL_PROGRESS(enc, @"dispatch groups indirect addr=0x%llx local=%zux%zux%zu", (unsigned long long)addr, local_size.x, local_size.y, local_size.z);
    }
 }
 
@@ -271,6 +282,7 @@ mtl_dispatch_threads_with_indirect_buffer(mtl_compute_encoder *encoder,
    @autoreleasepool {
       id<MTL4ComputeCommandEncoder> enc = (id<MTL4ComputeCommandEncoder>)encoder;
       [enc dispatchThreadsWithIndirectBuffer:addr];
+      MTL_PROGRESS(enc, @"dispatch threads indirect addr=0x%llx", (unsigned long long)addr);
    }
 }
 
@@ -284,7 +296,10 @@ mtl_new_render_command_encoder_with_descriptor(
    @autoreleasepool {
       id<MTL4CommandBuffer> cmd = (id<MTL4CommandBuffer>)command_buffer;
       MTL4RenderPassDescriptor *desc = (MTL4RenderPassDescriptor *)descriptor;
-      return [[cmd renderCommandEncoderWithDescriptor:desc] retain];
+      id<MTL4RenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:desc];
+      mtl_progress_attach(cmd, enc, true);
+      mtl_progress_render_pass(enc, desc);
+      return [enc retain];
    }
 }
 
@@ -318,6 +333,7 @@ mtl_render_set_pipeline_state(mtl_render_encoder *encoder,
       id<MTL4RenderCommandEncoder> enc = (id<MTL4RenderCommandEncoder>)encoder;
       id<MTLRenderPipelineState> pipe = (id<MTLRenderPipelineState>)pipeline;
       [enc setRenderPipelineState:pipe];
+      mtl_progress_pipeline(enc, pipe);
    }
 }
 
@@ -457,6 +473,7 @@ mtl_draw_primitives(mtl_render_encoder *encoder,
       id<MTL4RenderCommandEncoder> enc = (id<MTL4RenderCommandEncoder>)encoder;
       MTLPrimitiveType type = (MTLPrimitiveType)primitve_type;
       [enc drawPrimitives:type vertexStart:vertexStart vertexCount:vertexCount instanceCount:instanceCount baseInstance:baseInstance];
+      MTL_PROGRESS(enc, @"draw vertices=%u instances=%u", vertexCount, instanceCount);
    }
 }
 
@@ -481,6 +498,7 @@ mtl_draw_indexed_primitives(mtl_render_encoder *encoder,
                    instanceCount:instance_count
                       baseVertex:base_vertex
                     baseInstance:base_instance];
+      MTL_PROGRESS(enc, @"draw indexed count=%u instances=%u", index_count, instance_count);
    }
 }
 
@@ -492,6 +510,7 @@ mtl_draw_primitives_indirect(mtl_render_encoder *encoder,
    @autoreleasepool {
       id<MTL4RenderCommandEncoder> enc = (id<MTL4RenderCommandEncoder>)encoder;
       [enc drawPrimitives:(MTLPrimitiveType)primitve_type indirectBuffer:addr];
+      MTL_PROGRESS(enc, @"draw indirect addr=0x%llx", (unsigned long long)addr);
    }
 }
 
@@ -512,6 +531,7 @@ mtl_draw_indexed_primitives_indirect(mtl_render_encoder *encoder,
                      indexBuffer:index_addr
                indexBufferLength:index_buffer_length
                   indirectBuffer:addr];
+      MTL_PROGRESS(enc, @"draw indexed indirect addr=0x%llx index_bytes=%llu", (unsigned long long)addr, (unsigned long long)index_buffer_length);
    }
 }
 

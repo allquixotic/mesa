@@ -112,6 +112,14 @@ kk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    if (result != VK_SUCCESS)
       goto fail_alloc;
 
+   /* Opt-in diagnostics for release builds: otherwise vk_device_set_lost's
+    * Metal feedback message is dropped when the app has no debug callback. */
+   instance->vk.enable_debug_logging =
+      debug_get_bool_option("MESA_KK_DIAGNOSTICS", false);
+   if (instance->vk.enable_debug_logging)
+      vk_logi(VK_LOG_NO_OBJS(&instance->vk),
+              "kk diagnostics: release-build Vulkan error logging enabled");
+
    instance->vk.physical_devices.enumerate = kk_enumerate_physical_devices;
    instance->vk.physical_devices.destroy = kk_physical_device_destroy;
 

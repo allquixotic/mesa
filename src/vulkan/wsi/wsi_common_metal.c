@@ -874,6 +874,25 @@ wsi_metal_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
    VkResult result = VK_SUCCESS;
    CAMetalDrawable *drawable = NULL;
 
+   /* The offscreen image is reused independently of which CAMetalDrawable
+    * nextDrawable returns. With a private blit queue, the previous present
+    * may still be reading this image after application work has completed.
+    * Wait before rebinding its drawable, recycling its command buffers, or
+    * allowing the common acquire path to signal the application semaphore.
+    * The common present-time throttle is too late to protect application
+    * writes submitted between acquire and present. */
+   const uint32_t i = chain->current_image_index % chain->base.image_count;
+   const VkFence reuse_fence = chain->base.fences[i];
+   if (reuse_fence != VK_NULL_HANDLE) {
+      const uint64_t now = os_time_get_nano();
+      const uint64_t remaining = info->timeout == UINT64_MAX ? UINT64_MAX :
+         (abs_timeout > now ? abs_timeout - now : 0);
+      result = wsi_chain->wsi->WaitForFences(wsi_chain->device, 1,
+                                            &reuse_fence, true, remaining);
+      if (result != VK_SUCCESS)
+         return result == VK_TIMEOUT && info->timeout == 0 ? VK_NOT_READY : result;
+   }
+
    /* nextDrawable blocks until the compositor gives a drawable back, for up
     * to one second, and then returns nil. A window that shows nothing may
     * not get one back for that long: the compositor can keep the drawables
@@ -943,7 +962,7 @@ wsi_metal_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
    if (result != VK_SUCCESS)
       return result;
 
-   uint32_t i = (chain->current_image_index++) % chain->base.image_count;
+   chain->current_image_index++;
    struct wsi_metal_image *image = &chain->images[i];
    *image_index = i;
    image->drawable = drawable;
